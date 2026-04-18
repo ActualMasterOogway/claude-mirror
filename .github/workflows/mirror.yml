@@ -2,7 +2,9 @@ name: Mirror Claude Code
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    # Offset from :00/:15/:30/:45 to avoid GitHub Actions peak-minute cron
+    # contention. Fires at :07, :22, :37, :52 past each hour.
+    - cron: '7-59/15 * * * *'
   workflow_dispatch:
     inputs:
       force_version:
