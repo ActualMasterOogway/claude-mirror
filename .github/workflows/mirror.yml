@@ -1,0 +1,152 @@
+name: Mirror Claude Code
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: 'Force mirror of a specific version (leave blank for upstream latest)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases
+  PLATFORMS: linux-x64 linux-x64-musl darwin-x64 win32-x64
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Resolve upstream versions
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.force_version }}" ]; then
+            LATEST="${{ inputs.force_version }}"
+            STABLE="$LATEST"
+          else
+            LATEST=$(curl -fsSL "$UPSTREAM/latest")
+            STABLE=$(curl -fsSL "$UPSTREAM/stable")
+          fi
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "stable=$STABLE" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest=$LATEST  stable=$STABLE"
+
+      - name: Skip-or-force check
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v${{ steps.ver.outputs.latest }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ -n "${{ inputs.force_version }}" ]; then
+              echo "Release $TAG exists and force_version is set; deleting."
+              gh release delete "$TAG" --yes --cleanup-tag
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Release $TAG already exists, skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download upstream binaries
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.latest }}"
+          mkdir -p orig patched
+          for P in $PLATFORMS; do
+            if [ "$P" = "win32-x64" ]; then BIN=claude.exe; else BIN=claude; fi
+            echo "Downloading $P/$BIN ..."
+            curl -fsSL --retry 3 --retry-delay 5 \
+              -o "orig/${P}-${BIN}" \
+              "$UPSTREAM/$VER/$P/$BIN"
+            ls -la "orig/${P}-${BIN}"
+          done
+
+      - name: Extract dumped.js (human-readable source)
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          python scripts/bun_patcher.py extract orig/linux-x64-claude patched/dumped.js
+          ls -la patched/dumped.js
+
+      - name: Patch binaries
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          for P in $PLATFORMS; do
+            if [ "$P" = "win32-x64" ]; then BIN=claude.exe; else BIN=claude; fi
+            echo "Patching $P/$BIN ..."
+            python scripts/bun_patcher.py patch "orig/${P}-${BIN}" \
+              --inject payload/rotate.js \
+              --force \
+              -o "patched/${P}-${BIN}"
+            ls -la "patched/${P}-${BIN}"
+          done
+
+      - name: Build manifest.json
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          python scripts/build_manifest.py patched/ --out patched/manifest.json
+          cat patched/manifest.json
+
+      - name: Create GitHub release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.latest }}"
+          TAG="v$VER"
+          NOTES=$(cat <<EOF
+          Patched mirror of upstream Claude Code ${VER}.
+
+          Assets:
+          - \`{platform}-claude[.exe]\` - patched binary, \`payload/rotate.js\` injected
+          - \`manifest.json\` - SHA-256 manifest the updater verifies against
+          - \`dumped.js\` - main module's JS source extracted from the upstream (unpatched) binary
+          EOF
+          )
+          gh release create "$TAG" patched/* --title "$TAG" --notes "$NOTES"
+
+      - name: Update version pointers
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          LATEST="${{ steps.ver.outputs.latest }}"
+          STABLE="${{ steps.ver.outputs.stable }}"
+          CHANGED=0
+          if [ "$(cat latest 2>/dev/null || true)" != "$LATEST" ]; then
+            printf '%s\n' "$LATEST" > latest
+            CHANGED=1
+          fi
+          if [ "$(cat stable 2>/dev/null || true)" != "$STABLE" ]; then
+            printf '%s\n' "$STABLE" > stable
+            CHANGED=1
+          fi
+          if [ "$CHANGED" = "1" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add latest stable
+            git commit -m "mirror: latest=$LATEST stable=$STABLE"
+            git push
+          else
+            echo "Pointers already current."
+          fi
