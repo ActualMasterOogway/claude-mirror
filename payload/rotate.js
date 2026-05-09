@@ -9,11 +9,72 @@
     "tok-rot.log"
   );
   try { fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true }); } catch (_) {}
-  const log = (...args) => {
-    const ts = new Date().toLocaleString();
-    try { fs.appendFileSync(LOG_FILE, `[${ts}] ${args.join(" ")}\n`); } catch (_) {}
-  };
 
+  const DEBUG = process.env.CLAUDE_MIRROR_DEBUG === "1";
+
+  const ts = () => new Date().toLocaleString();
+  const log = (...args) => {
+    try { fs.appendFileSync(LOG_FILE, `[${ts()}] ${args.map(stringify).join(" ")}\n`); } catch (_) {}
+  };
+  const dlog = (...args) => { if (DEBUG) log("[debug]", ...args); };
+
+  // --- Safe stringifier for arbitrary values (Headers, Request, Buffer, circular refs)
+  function stringify(v) {
+    if (v === null || v === undefined) return String(v);
+    if (typeof v === "string") return v;
+    if (typeof v === "number" || typeof v === "boolean" || typeof v === "bigint") return String(v);
+    if (v instanceof Error) return `${v.name}: ${v.message}${v.stack ? "\n" + v.stack : ""}`;
+    if (typeof Headers !== "undefined" && v instanceof Headers) {
+      const o = {};
+      try { v.forEach((val, k) => { o[k] = (k.toLowerCase() === "authorization") ? "Bearer ***" : val; }); } catch (_) {}
+      return JSON.stringify(o);
+    }
+    if (typeof Buffer !== "undefined" && Buffer.isBuffer(v)) return `<Buffer ${v.length}B>`;
+    try { return JSON.stringify(v, replacer); } catch { return String(v); }
+  }
+  function replacer(key, val) {
+    if (key.toLowerCase && key.toLowerCase() === "authorization") return "Bearer ***";
+    if (typeof Headers !== "undefined" && val instanceof Headers) {
+      const o = {};
+      try { val.forEach((v, k) => { o[k] = (k.toLowerCase() === "authorization") ? "Bearer ***" : v; }); } catch (_) {}
+      return o;
+    }
+    return val;
+  }
+
+  // --- Snapshot helpers (capture before/after state for debugging) ---
+  function snapshotInit(input, init) {
+    const url = (typeof input === "string" || input instanceof URL) ? String(input) : (input && input.url) || "?";
+    const method = (init && init.method) || (input && input.method) || "GET";
+    const headers = init && init.headers ? init.headers : (input && input.headers);
+    let bodyHint = null;
+    const body = init && init.body;
+    if (body) {
+      if (typeof body === "string") bodyHint = body.length > 4000 ? `<string ${body.length}B: ${body.slice(0, 200)}...>` : body;
+      else if (typeof Buffer !== "undefined" && Buffer.isBuffer(body)) bodyHint = `<Buffer ${body.length}B>`;
+      else if (body && typeof body.byteLength === "number") bodyHint = `<bytes ${body.byteLength}B>`;
+      else bodyHint = `<${typeof body}>`;
+    }
+    return { url, method, headers, body: bodyHint };
+  }
+
+  async function snapshotResponse(r) {
+    if (!r) return { ok: false, note: "no response" };
+    const out = {
+      status: r.status,
+      statusText: r.statusText,
+      url: r.url,
+      headers: r.headers,
+    };
+    try {
+      const cloned = r.clone();
+      const txt = await cloned.text();
+      out.body = txt.length > 4000 ? txt.slice(0, 4000) + `...<truncated ${txt.length - 4000}B>` : txt;
+    } catch (e) { out.body_read_error = e && e.message; }
+    return out;
+  }
+
+  // --- Mirror config ---
   const REPO_OWNER = "ActualMasterOogway";
   const REPO_NAME  = "claude-mirror";
   const REPO_BRANCH = "main";
@@ -65,6 +126,7 @@
     } catch { return null; }
   }
 
+  // --- https.request hook (axios / Node-style) ---
   const origHttpsRequest = https.request;
   https.request = function (opts, cb) {
     if (opts && typeof opts === "object" && !Buffer.isBuffer(opts)) {
@@ -73,7 +135,7 @@
       if (host.includes(GCS_HOST)) {
         const mapped = rewriteMirrorPath(p);
         if (mapped) {
-          log(`[mirror] REDIRECT: https://${host}${p} -> https://${mapped.host}${mapped.path}`);
+          log(`[mirror.http] REDIRECT https://${host}${p} -> https://${mapped.host}${mapped.path}`);
           opts = {
             ...opts,
             hostname: mapped.host,
@@ -87,6 +149,7 @@
     return origHttpsRequest.call(this, opts, cb);
   };
 
+  // --- Token rotation + Anthropic proxy ---
   const tokens = (process.env.CLAUDE_CODE_OAUTH_TOKEN || "")
     .split(",").map(s => s.trim()).filter(Boolean);
 
@@ -116,13 +179,16 @@
 
       const mirrored = rewriteUrl(urlStr);
       if (mirrored) {
-        log(`[mirror-fetch] REDIRECT: ${urlStr} -> ${mirrored}`);
+        log(`[mirror.fetch] REDIRECT ${urlStr} -> ${mirrored}`);
         input = typeof input === "string" ? mirrored : new Request(mirrored, input);
         urlStr = mirrored;
       }
 
       if (urlStr.includes("anthropic.com")) applyAuth(init);
       if (!init._skipCount) init._skipCount = 0;
+
+      const reqSnap = snapshotInit(input, init);
+      dlog(`[fetch] -> ${reqSnap.method} ${reqSnap.url}`);
 
       let r;
       try {
@@ -135,16 +201,31 @@
           }
         }
       } catch (err) {
-        log(`[tok-rot] Fetch error: ${err.message}`);
+        // Capture full context on network failure: URL, method, headers (auth redacted),
+        // body summary, error name/message/stack, and which token was active.
+        const ctx = {
+          phase: "fetch_throw",
+          url: reqSnap.url,
+          method: reqSnap.method,
+          token_index: index + 1,
+          token_count: tokens.length,
+          request: { headers: reqSnap.headers, body: reqSnap.body },
+          error: err && (err.stack || err.message || String(err)),
+          error_name: err && err.name,
+          error_code: err && (err.code || err.errno || err.cause?.code),
+        };
+        log("[tok-rot] FETCH_ERROR", JSON.stringify(ctx, replacer));
+        // Fall through with r=undefined so the rotation logic below can still try the next token.
       }
 
       if (urlStr.includes("/v1/messages")) {
         let isExhausted = false;
         let reasonLabel = "unknown";
+        let respSnap = null;
 
         if (!r || r.status === 500) {
           isExhausted = true;
-          reasonLabel = "persistent_500_or_net_error";
+          reasonLabel = !r ? "network_error" : "persistent_500";
         } else if (r.status === 429 || r.status === 401 || r.status === 400 || r.status === 403) {
           let body;
           try { body = await r.clone().json(); } catch (_) {}
@@ -162,15 +243,33 @@
             (!hasRetry && !reason && !ovStatus) ||
             r.statusText === "Unauthorized";
 
-          reasonLabel = isExhausted ? "token_exhausted" : "other_429";
+          reasonLabel = isExhausted ? "token_exhausted" : "other_4xx";
+
+          // Always capture full failure context for /v1/messages 4xx — invaluable for tuning the
+          // exhaustion heuristic above.
+          respSnap = await snapshotResponse(r);
+          log("[tok-rot] /v1/messages 4xx", JSON.stringify({
+            phase: "non_2xx",
+            url: urlStr,
+            token_index: index + 1,
+            token_count: tokens.length,
+            decision: isExhausted ? "rotate" : "return_to_caller",
+            reason_label: reasonLabel,
+            heuristic: { msg, overage_reason: reason, overage_status: ovStatus, has_retry_after: hasRetry, statusText: r.statusText },
+            response: respSnap,
+            request: { method: reqSnap.method, headers: reqSnap.headers, body: reqSnap.body },
+          }, replacer));
         }
 
-        const MAX_SKIPS = 15;
+        const MAX_SKIPS = tokens.length;
         if (isExhausted && index < tokens.length - 1 && init._skipCount < MAX_SKIPS) {
           index++;
           init._skipCount++;
-          log(`[tok-rot] >>> ROTATING (${reasonLabel}) | Skip ${init._skipCount}/${MAX_SKIPS} | New Token: #${index + 1}`);
+          log(`[tok-rot] >>> ROTATING (${reasonLabel}) | Skip ${index}/${MAX_SKIPS} | New Token: #${index + 1}`);
           return recursiveFetch(input, init);
+        }
+        if (isExhausted) {
+          log(`[tok-rot] EXHAUSTED — no more tokens to try (last token=#${index + 1}, total=${tokens.length})`);
         }
       }
 

@@ -727,65 +727,96 @@ def _rebuild_elf_patch(original_data: bytes, elf: ELFInfo,
     """
     Rebuild the ELF with the modified .bun section.
 
-    Since .bun is the last data section before the section header table,
-    we can safely expand it and move the section header table forward.
+    Strategy: insert (new_raw_size - bun_raw_size) bytes of bundle expansion
+    between the old bun-LOAD region and everything that follows it. Every
+    program/section header field that points past the old bundle end is
+    shifted forward by the same delta. This preserves non-allocatable
+    sections (.comment/.symtab/.strtab/.shstrtab) that live between the LOAD
+    end and the section header table, and keeps pre-.bun LOAD sections
+    (.tdata/.data/.got/.bss) within the LOAD segment after we grow its
+    p_filesz/p_memsz.
     """
     new_raw_size = len(bundle_final)
+    delta = new_raw_size - elf.bun_raw_size  # bytes added to the bundle
 
-    # 1. Everything before .bun section data
+    # 1. Build the new file: everything before .bun, then expanded bundle,
+    #    then everything that was after the original bun-LOAD region.
     result = bytearray(original_data[:elf.bun_off])
-    # 2. New .bun section data (includes metadata + alignment padding)
     result.extend(bundle_final)
-    # 3. Move section header table to after the new .bun data
-    shdr_table_size = elf.e_shnum * SHDR_SIZE
-    new_shdr_off = len(result)
-    result.extend(original_data[elf.e_shoff : elf.e_shoff + shdr_table_size])
-    # 4. Preserve any data after the old section header table (rare but safe)
-    old_shdr_end = elf.e_shoff + shdr_table_size
-    if old_shdr_end < len(original_data):
-        result.extend(original_data[old_shdr_end:])
+    threshold = elf.bun_off + elf.bun_raw_size  # old end of bun-LOAD region
+    result.extend(original_data[threshold:])
 
-    # -- Update ELF header --
-    _p64(result, 0x28, new_shdr_off)                       # e_shoff
+    # 2. Update e_shoff (section header table shifted forward by delta).
+    new_e_shoff = elf.e_shoff + delta
+    _p64(result, 0x28, new_e_shoff)
 
-    # -- Update .bun section header --
-    bun_shdr = new_shdr_off + elf.bun_shdr_idx * SHDR_SIZE
-    _p64(result, bun_shdr + 0x20, new_vsize)                # sh_size
-
-    # -- Update LOAD program header covering .bun --
+    # 3. Update LOAD program header for .bun: grow filesz/memsz by delta so
+    #    pre-.bun sections (.tdata, .data, .got, etc.) stay mapped.
     ph = elf.e_phoff + elf.bun_phdr_idx * PHDR_SIZE
-    _p64(result, ph + 0x20, new_raw_size)                    # p_filesz
-    _p64(result, ph + 0x28, new_raw_size)                    # p_memsz
+    old_p_filesz = _u64(result, ph + 0x20)
+    old_p_memsz  = _u64(result, ph + 0x28)
+    _p64(result, ph + 0x20, old_p_filesz + delta)
+    _p64(result, ph + 0x28, old_p_memsz + delta)
 
-    print(f"  e_shoff:       {elf.e_shoff:,} -> {new_shdr_off:,}")
+    # 4. Shift every program header whose p_offset is past the old bundle end.
+    for i in range(elf.e_phnum):
+        php = elf.e_phoff + i * PHDR_SIZE
+        p_offset = _u64(result, php + 0x08)
+        if p_offset >= threshold:
+            _p64(result, php + 0x08, p_offset + delta)
+
+    # 5. Walk the (now relocated) section header table and shift sh_offset
+    #    for every section past the old bundle end.
+    for i in range(elf.e_shnum):
+        shdr_pos = new_e_shoff + i * SHDR_SIZE
+        sh_offset = _u64(result, shdr_pos + 0x18)
+        if sh_offset >= threshold:
+            _p64(result, shdr_pos + 0x18, sh_offset + delta)
+
+    # 6. Update .bun section header sh_size to the new bun-data vsize.
+    bun_shdr = new_e_shoff + elf.bun_shdr_idx * SHDR_SIZE
+    _p64(result, bun_shdr + 0x20, new_vsize)
+
+    print(f"  e_shoff:       {elf.e_shoff:,} -> {new_e_shoff:,}")
+    print(f"  LOAD p_filesz: {old_p_filesz:,} -> {old_p_filesz + delta:,}")
     return bytes(result)
 
 
 def _rebuild_elf_unpatch(patched_data: bytes, elf: ELFInfo,
                          padded_bundle: bytes, old_vsize: int,
                          meta: PatchMetadata) -> bytes:
-    """Rebuild ELF after removing the patch."""
+    """Rebuild ELF after removing the patch (mirror of _rebuild_elf_patch)."""
     new_raw_size = len(padded_bundle)
+    delta = new_raw_size - elf.bun_raw_size  # negative when shrinking
 
     result = bytearray(patched_data[:elf.bun_off])
     result.extend(padded_bundle)
+    threshold = elf.bun_off + elf.bun_raw_size
+    result.extend(patched_data[threshold:])
 
-    shdr_table_size = elf.e_shnum * SHDR_SIZE
-    new_shdr_off = len(result)
-    result.extend(patched_data[elf.e_shoff : elf.e_shoff + shdr_table_size])
-
-    old_shdr_end = elf.e_shoff + shdr_table_size
-    if old_shdr_end < len(patched_data):
-        result.extend(patched_data[old_shdr_end:])
-
-    _p64(result, 0x28, new_shdr_off)
-
-    bun_shdr = new_shdr_off + elf.bun_shdr_idx * SHDR_SIZE
-    _p64(result, bun_shdr + 0x20, old_vsize)
+    new_e_shoff = elf.e_shoff + delta
+    _p64(result, 0x28, new_e_shoff)
 
     ph = elf.e_phoff + elf.bun_phdr_idx * PHDR_SIZE
-    _p64(result, ph + 0x20, new_raw_size)
-    _p64(result, ph + 0x28, new_raw_size)
+    old_p_filesz = _u64(result, ph + 0x20)
+    old_p_memsz  = _u64(result, ph + 0x28)
+    _p64(result, ph + 0x20, old_p_filesz + delta)
+    _p64(result, ph + 0x28, old_p_memsz + delta)
+
+    for i in range(elf.e_phnum):
+        php = elf.e_phoff + i * PHDR_SIZE
+        p_offset = _u64(result, php + 0x08)
+        if p_offset >= threshold:
+            _p64(result, php + 0x08, p_offset + delta)
+
+    for i in range(elf.e_shnum):
+        shdr_pos = new_e_shoff + i * SHDR_SIZE
+        sh_offset = _u64(result, shdr_pos + 0x18)
+        if sh_offset >= threshold:
+            _p64(result, shdr_pos + 0x18, sh_offset + delta)
+
+    bun_shdr = new_e_shoff + elf.bun_shdr_idx * SHDR_SIZE
+    _p64(result, bun_shdr + 0x20, old_vsize)
 
     return bytes(result)
 
