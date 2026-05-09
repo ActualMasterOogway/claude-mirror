@@ -148,7 +148,13 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add latest stable
             git commit -m "mirror: latest=$LATEST stable=$STABLE"
-            git push
+            # Race-tolerant: if main has moved (e.g. another mirror run pushed
+            # pointers concurrently), rebase and try again before giving up.
+            for attempt in 1 2 3; do
+              if git push; then break; fi
+              echo "push attempt $attempt rejected; rebasing on main"
+              git pull --rebase origin main
+            done
           else
             echo "Pointers already current."
           fi
