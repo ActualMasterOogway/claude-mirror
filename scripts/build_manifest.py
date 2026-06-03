@@ -18,7 +18,15 @@ import re
 import sys
 from pathlib import Path
 
-PLATFORMS = ("linux-x64", "linux-x64-musl", "darwin-x64", "win32-x64")
+PLATFORMS = (
+    "linux-x64",
+    "linux-x64-musl",
+    "linux-arm64",
+    "darwin-x64",
+    "darwin-arm64",
+    "win32-x64",
+    "win32-arm64",
+)
 
 
 def sha256(path: Path) -> str:
