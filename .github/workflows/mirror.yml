@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  UPSTREAM: https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases
+  UPSTREAM: https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases # TODO: https://downloads.claude.ai/claude-code-releases ?
   PLATFORMS: linux-x64 linux-x64-musl linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64
 
 jobs:

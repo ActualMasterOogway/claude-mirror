@@ -79,8 +79,8 @@
   const REPO_NAME  = "claude-mirror";
   const REPO_BRANCH = "main";
 
-  const GCS_HOST = "storage.googleapis.com";
-  const GCS_PATH = "/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases";
+  const GCS_HOST = "downloads.claude.ai";
+  const GCS_PATH = "/claude-code-releases";
 
   const RAW_HOST     = "raw.githubusercontent.com";
   const RELEASE_HOST = "github.com";
