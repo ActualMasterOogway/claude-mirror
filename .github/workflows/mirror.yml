@@ -21,7 +21,7 @@ concurrency:
 
 env:
   UPSTREAM: https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases
-  PLATFORMS: linux-x64 linux-x64-musl darwin-x64 win32-x64
+  PLATFORMS: linux-x64 linux-x64-musl linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64
 
 jobs:
   mirror:
@@ -75,7 +75,7 @@ jobs:
           VER="${{ steps.ver.outputs.latest }}"
           mkdir -p orig patched
           for P in $PLATFORMS; do
-            if [ "$P" = "win32-x64" ]; then BIN=claude.exe; else BIN=claude; fi
+            if [[ "$P" == win32-* ]]; then BIN=claude.exe; else BIN=claude; fi
             echo "Downloading $P/$BIN ..."
             curl -fsSL --retry 3 --retry-delay 5 \
               -o "orig/${P}-${BIN}" \
@@ -94,7 +94,7 @@ jobs:
         run: |
           set -euo pipefail
           for P in $PLATFORMS; do
-            if [ "$P" = "win32-x64" ]; then BIN=claude.exe; else BIN=claude; fi
+            if [[ "$P" == win32-* ]]; then BIN=claude.exe; else BIN=claude; fi
             echo "Patching $P/$BIN ..."
             python scripts/bun_patcher.py patch "orig/${P}-${BIN}" \
               --inject payload/rotate.js \
