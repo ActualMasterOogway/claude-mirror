@@ -130,15 +130,7 @@ jobs:
           set -euo pipefail
           VER="${{ steps.ver.outputs.latest }}"
           TAG="v$VER"
-          NOTES=$(cat <<EOF
-          Patched mirror of upstream Claude Code ${VER}.
-
-          Assets:
-          - \`{platform}-claude[.exe]\` - patched binary, \`payload/rotate.js\` injected
-          - \`manifest.json\` - SHA-256 manifest the updater verifies against
-          - \`dumped.js\` - main module's JS source extracted from the upstream (unpatched) binary
-          EOF
-          )
+          NOTES=$(printf $'Patched mirror of upstream Claude Code %s.\n\nAssets:\n- `{platform}-claude[.exe]` - patched binary, `payload/rotate.js` injected\n- `manifest.json` - SHA-256 manifest the updater verifies against\n- `dumped.js` - main module\'s JS source extracted from the upstream (unpatched) binary\n' "$VER")
           gh release create "$TAG" patched/* --title "$TAG" --notes "$NOTES"
 
       - name: Update version pointers
