@@ -892,6 +892,46 @@ def _shift_macho_offsets(result: bytearray, mo: MachOInfo, size_diff: int) -> No
         cmd_off += cmdsize
 
 
+def _remove_macho_code_signature_command(result: bytearray, mo: MachOInfo) -> None:
+    """
+    Drop the LC_CODE_SIGNATURE load command after mutating Mach-O contents.
+
+    Patched binaries need a fresh signature. Leaving an empty LC_CODE_SIGNATURE
+    command makes Apple Silicon treat the executable as malformed and also
+    prevents `codesign --sign -` from adding an ad-hoc signature.
+    """
+    if not mo.codesign_cmd_off:
+        return
+
+    ncmds = _u32(result, 0x10)
+    sizeofcmds = _u32(result, 0x14)
+    cmd_off = MACHO_HEADER_SIZE
+    commands: list[tuple[int, int, int]] = []
+
+    for _ in range(ncmds):
+        if cmd_off + 8 > len(result):
+            break
+        cmd = _u32(result, cmd_off)
+        cmdsize = _u32(result, cmd_off + 4)
+        commands.append((cmd_off, cmd, cmdsize))
+        cmd_off += cmdsize
+
+    for off, cmd, cmdsize in commands:
+        if off != mo.codesign_cmd_off or cmd != LC_CODE_SIGNATURE:
+            continue
+
+        end = off + cmdsize
+        tail = result[end:cmd_off]
+        result[off : off + len(tail)] = tail
+        for pos in range(off + len(tail), cmd_off):
+            result[pos] = 0
+
+        _p32(result, 0x10, ncmds - 1)
+        _p32(result, 0x14, sizeofcmds - cmdsize)
+        print("  removed stale LC_CODE_SIGNATURE load command")
+        return
+
+
 def _rebuild_macho_patch(original_data: bytes, mo: MachOInfo,
                          bundle_final: bytearray, new_vsize: int) -> bytes:
     """
@@ -923,9 +963,7 @@ def _rebuild_macho_patch(original_data: bytes, mo: MachOInfo,
         _shift_macho_offsets(result, mo, size_diff)
 
     # -- Invalidate code signature --
-    if mo.codesign_cmd_off:
-        _p32(result, mo.codesign_cmd_off + 8, 0)             # dataoff
-        _p32(result, mo.codesign_cmd_off + 12, 0)            # datasize
+    _remove_macho_code_signature_command(result, mo)
 
     print(f"  __BUN vmsize:  {mo.bun_seg_vmsize:,} -> {new_vmsize:,}")
     return bytes(result)
@@ -953,9 +991,7 @@ def _rebuild_macho_unpatch(patched_data: bytes, mo: MachOInfo,
     if size_diff != 0:
         _shift_macho_offsets(result, mo, size_diff)
 
-    if mo.codesign_cmd_off:
-        _p32(result, mo.codesign_cmd_off + 8, 0)
-        _p32(result, mo.codesign_cmd_off + 12, 0)
+    _remove_macho_code_signature_command(result, mo)
 
     return bytes(result)
 

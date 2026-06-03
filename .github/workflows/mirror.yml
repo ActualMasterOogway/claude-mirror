@@ -25,7 +25,7 @@ env:
 
 jobs:
   mirror:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -101,6 +101,19 @@ jobs:
               --force \
               -o "patched/${P}-${BIN}"
             ls -la "patched/${P}-${BIN}"
+          done
+
+      - name: Ad-hoc sign Darwin binaries
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          for P in darwin-x64 darwin-arm64; do
+            BIN="patched/${P}-claude"
+            if [ -f "$BIN" ]; then
+              echo "Signing $BIN ..."
+              codesign --force --sign - "$BIN"
+              codesign --verify --verbose=2 "$BIN"
+            fi
           done
 
       - name: Build manifest.json
