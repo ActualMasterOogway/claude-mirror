@@ -10,15 +10,18 @@
   );
   try { fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true }); } catch (_) {}
 
-  const DEBUG = process.env.CLAUDE_MIRROR_DEBUG === "1";
+  // CLAUDE_MIRROR_DEBUG=1  → verbose per-request traces
+  // CLAUDE_MIRROR_DEBUG=2  → also log full request body snapshots
+  const DEBUG = parseInt(process.env.CLAUDE_MIRROR_DEBUG || "0", 10);
 
   const ts = () => new Date().toLocaleString();
   const log = (...args) => {
     try { fs.appendFileSync(LOG_FILE, `[${ts()}] ${args.map(stringify).join(" ")}\n`); } catch (_) {}
   };
-  const dlog = (...args) => { if (DEBUG) log("[debug]", ...args); };
+  const dlog  = (...args) => { if (DEBUG >= 1) log("[dbg1]", ...args); };
+  const dlog2 = (...args) => { if (DEBUG >= 2) log("[dbg2]", ...args); };
 
-  // --- Safe stringifier for arbitrary values (Headers, Request, Buffer, circular refs)
+  // --- Safe stringifier ---
   function stringify(v) {
     if (v === null || v === undefined) return String(v);
     if (typeof v === "string") return v;
@@ -26,57 +29,72 @@
     if (v instanceof Error) return `${v.name}: ${v.message}${v.stack ? "\n" + v.stack : ""}`;
     if (typeof Headers !== "undefined" && v instanceof Headers) {
       const o = {};
-      try { v.forEach((val, k) => { o[k] = (k.toLowerCase() === "authorization") ? "Bearer ***" : val; }); } catch (_) {}
+      try { v.forEach((val, k) => { o[k] = k.toLowerCase() === "authorization" ? redactBearer(val) : val; }); } catch (_) {}
       return JSON.stringify(o);
     }
     if (typeof Buffer !== "undefined" && Buffer.isBuffer(v)) return `<Buffer ${v.length}B>`;
     try { return JSON.stringify(v, replacer); } catch { return String(v); }
   }
+  function redactBearer(val) {
+    if (typeof val !== "string") return "***";
+    const m = val.match(/^(Bearer\s+)(.{6}).*(.{4})$/i);
+    return m ? `${m[1]}${m[2]}…${m[3]}` : "Bearer ***";
+  }
   function replacer(key, val) {
-    if (key.toLowerCase && key.toLowerCase() === "authorization") return "Bearer ***";
+    if (key.toLowerCase && key.toLowerCase() === "authorization") return redactBearer(val);
     if (typeof Headers !== "undefined" && val instanceof Headers) {
       const o = {};
-      try { val.forEach((v, k) => { o[k] = (k.toLowerCase() === "authorization") ? "Bearer ***" : v; }); } catch (_) {}
+      try { val.forEach((v, k) => { o[k] = k.toLowerCase() === "authorization" ? redactBearer(v) : v; }); } catch (_) {}
       return o;
     }
     return val;
   }
 
-  // --- Snapshot helpers (capture before/after state for debugging) ---
+  // --- Body type classifier (helps diagnose stream-consumption bugs) ---
+  function classifyBody(body) {
+    if (body === null || body === undefined) return "none";
+    if (typeof body === "string") return `string(${body.length}B)`;
+    if (typeof Buffer !== "undefined" && Buffer.isBuffer(body)) return `Buffer(${body.length}B)`;
+    if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return `binary(${body.byteLength}B)`;
+    if (typeof ReadableStream !== "undefined" && body instanceof ReadableStream)
+      return `ReadableStream(locked=${body.locked})`;
+    if (body instanceof FormData) return "FormData";
+    if (body instanceof URLSearchParams) return "URLSearchParams";
+    if (body instanceof Blob) return `Blob(${body.size}B)`;
+    if (body && (Symbol.asyncIterator in body)) return "AsyncIterator";
+    return `unknown(${typeof body})`;
+  }
+
   function snapshotInit(input, init) {
-    const url = (typeof input === "string" || input instanceof URL) ? String(input) : (input && input.url) || "?";
-    const method = (init && init.method) || (input && input.method) || "GET";
-    const headers = init && init.headers ? init.headers : (input && input.headers);
-    let bodyHint = null;
-    const body = init && init.body;
-    if (body) {
-      if (typeof body === "string") bodyHint = body.length > 4000 ? `<string ${body.length}B: ${body.slice(0, 200)}...>` : body;
-      else if (typeof Buffer !== "undefined" && Buffer.isBuffer(body)) bodyHint = `<Buffer ${body.length}B>`;
-      else if (body && typeof body.byteLength === "number") bodyHint = `<bytes ${body.byteLength}B>`;
-      else bodyHint = `<${typeof body}>`;
+    const url    = (typeof input === "string" || input instanceof URL) ? String(input) : (input?.url || "?");
+    const method = init?.method || input?.method || "GET";
+    const bodyKind = classifyBody(init?.body ?? input?.body);
+    let bodyPreview = null;
+    if (DEBUG >= 2 && typeof init?.body === "string") {
+      bodyPreview = init.body.length > 800 ? init.body.slice(0, 800) + "…" : init.body;
     }
-    return { url, method, headers, body: bodyHint };
+    return { url, method, bodyKind, bodyPreview };
   }
 
   async function snapshotResponse(r) {
     if (!r) return { ok: false, note: "no response" };
-    const out = {
-      status: r.status,
-      statusText: r.statusText,
-      url: r.url,
-      headers: r.headers,
-    };
+    const hdrs = {};
     try {
-      const cloned = r.clone();
-      const txt = await cloned.text();
-      out.body = txt.length > 4000 ? txt.slice(0, 4000) + `...<truncated ${txt.length - 4000}B>` : txt;
-    } catch (e) { out.body_read_error = e && e.message; }
+      r.headers.forEach((v, k) => {
+        hdrs[k] = k.toLowerCase() === "authorization" ? redactBearer(v) : v;
+      });
+    } catch (_) {}
+    const out = { status: r.status, statusText: r.statusText, url: r.url, headers: hdrs };
+    try {
+      const txt = await r.clone().text();
+      out.body = txt.length > 2000 ? txt.slice(0, 2000) + `…(+${txt.length - 2000}B)` : txt;
+    } catch (e) { out.body_read_error = e?.message; }
     return out;
   }
 
   // --- Mirror config ---
-  const REPO_OWNER = "ActualMasterOogway";
-  const REPO_NAME  = "claude-mirror";
+  const REPO_OWNER  = "ActualMasterOogway";
+  const REPO_NAME   = "claude-mirror";
   const REPO_BRANCH = "main";
 
   const GCS_HOST = "downloads.claude.ai";
@@ -157,6 +175,7 @@
     log(`[tok-rot] Found ${tokens.length} token(s), rotation disabled`);
   } else {
     let index = 0;
+
     Object.defineProperty(process.env, "CLAUDE_CODE_OAUTH_TOKEN", {
       get: () => tokens[index] ?? tokens[0],
       set: () => {},
@@ -164,14 +183,69 @@
       enumerable: true,
     });
 
+    log(`[tok-rot] Rotation ENABLED: ${tokens.length} tokens loaded`);
+
     const getUrlString = (input) =>
-      (typeof input === "string" || input instanceof URL) ? String(input) : (input.url || String(input));
+      (typeof input === "string" || input instanceof URL) ? String(input) : (input?.url || String(input));
 
     const applyAuth = (init) => {
+      const tok = tokens[index];
       if (!init.headers) init.headers = new Headers();
       else if (!(init.headers instanceof Headers)) init.headers = new Headers(init.headers);
-      init.headers.set("Authorization", `Bearer ${tokens[index]}`);
+      init.headers.set("Authorization", `Bearer ${tok}`);
+      return tok;
     };
+
+    // Snapshot response headers relevant to rate-limiting
+    function rateLimitHeaders(r) {
+      const get = (h) => r?.headers?.get?.(h) || null;
+      return {
+        "retry-after":           get("retry-after"),
+        "x-ratelimit-remaining": get("x-ratelimit-limit-requests") && get("x-ratelimit-remaining-requests"),
+        "overage-reason":        get("anthropic-ratelimit-unified-overage-disabled-reason"),
+        "overage-status":        get("anthropic-ratelimit-unified-overage-status"),
+        "request-id":            get("request-id"),
+        "cf-ray":                get("cf-ray"),
+      };
+    }
+
+    // Classify WHY a token should be considered exhausted (vs. a retryable error)
+    function exhaustionCheck(r, body) {
+      if (!r) return { exhausted: true, reason: "no_response" };
+      if (r.status === 500) return { exhausted: true, reason: "persistent_500" };
+
+      const msg      = body?.error?.message ?? "";
+      const reason   = r.headers?.get?.("anthropic-ratelimit-unified-overage-disabled-reason") || null;
+      const ovStatus = r.headers?.get?.("anthropic-ratelimit-unified-overage-status") || null;
+      const hasRetry = !!r.headers?.get?.("retry-after");
+
+      // Hard exhaustion signals — token is definitely dead/blocked
+      if (msg.includes("OAuth authentication is currently not allowed")) return { exhausted: true, reason: "oauth_not_allowed" };
+      if (msg.includes("OAuth token has been revoked"))                   return { exhausted: true, reason: "token_revoked" };
+      if (msg.toLowerCase().includes("organization has been disabled"))   return { exhausted: true, reason: "org_disabled" };
+      if (r.statusText === "Unauthorized")                                return { exhausted: true, reason: "unauthorized" };
+      if (r.status === 401)                                               return { exhausted: true, reason: "401" };
+
+      // Credit/overage exhaustion
+      if (reason === "out_of_credits" || reason === "org_level_disabled")
+                                        return { exhausted: true,  reason: reason };
+      if (ovStatus === "rejected")      return { exhausted: true,  reason: "overage_rejected" };
+
+      // 429 WITH retry-after = normal rate limit, NOT exhausted — let the SDK handle it
+      if (r.status === 429 && hasRetry) return { exhausted: false, reason: "rate_limited_retryable" };
+
+      // 429 WITHOUT retry-after and without overage headers = likely credit exhaustion
+      if (r.status === 429 && !hasRetry && !reason && !ovStatus) return { exhausted: true, reason: "429_no_retry_after" };
+
+      // 403 without overage context = token permission/scope issue, rotate
+      if (r.status === 403) return { exhausted: true, reason: "403_forbidden" };
+
+      // 400 = request is malformed, NOT a token issue — don't rotate, return to caller
+      // (rotating won't help; the same body will get the same 400 from every token)
+      if (r.status === 400) return { exhausted: false, reason: "400_bad_request" };
+
+      return { exhausted: false, reason: `other_${r.status}` };
+    }
 
     const origFetch = globalThis.fetch;
     globalThis.fetch = async function recursiveFetch(input, init = {}) {
@@ -184,92 +258,107 @@
         urlStr = mirrored;
       }
 
-      if (urlStr.includes("anthropic.com")) applyAuth(init);
+      const isMessages = urlStr.includes("/v1/messages");
+      const isAnthropicApi = urlStr.includes("anthropic.com");
+
+      if (isAnthropicApi) applyAuth(init);
       if (!init._skipCount) init._skipCount = 0;
 
       const reqSnap = snapshotInit(input, init);
-      dlog(`[fetch] -> ${reqSnap.method} ${reqSnap.url}`);
+
+      if (isMessages) {
+        dlog(`[fetch] ${reqSnap.method} ${reqSnap.url} | token=#${index + 1}/${tokens.length} | skip=${init._skipCount} | body=${reqSnap.bodyKind}`);
+        if (reqSnap.bodyPreview) dlog2(`[fetch] body-preview: ${reqSnap.bodyPreview}`);
+      }
+
+      // Warn if body type is a ReadableStream — subsequent retries cannot re-send it
+      if (isMessages && init.body && typeof ReadableStream !== "undefined" && init.body instanceof ReadableStream) {
+        log(`[tok-rot] WARN body is ReadableStream(locked=${init.body.locked}) — rotation retries cannot re-send this body`);
+      }
 
       let r;
       try {
         r = await origFetch.call(globalThis, input, init);
-        if (r.status === 500 && urlStr.includes("/v1/messages")) {
+
+        // 500 immediate-retry loop (same token, transient server error)
+        if (r.status === 500 && isMessages) {
           for (let attempt = 1; attempt <= 3; attempt++) {
-            log(`[tok-rot] 500 error (Token #${index + 1}), immediate retry ${attempt}/3...`);
+            log(`[tok-rot] 500 on token #${index + 1}, retry ${attempt}/3`);
+            // NOTE: if body is a ReadableStream, this re-send will fail silently (empty body)
             r = await origFetch.call(globalThis, input, init);
-            if (r.status !== 500) break;
+            if (r.status !== 500) {
+              dlog(`[tok-rot] 500 retry ${attempt} resolved to ${r.status}`);
+              break;
+            }
           }
         }
       } catch (err) {
-        // Capture full context on network failure: URL, method, headers (auth redacted),
-        // body summary, error name/message/stack, and which token was active.
+        // AbortError = the SDK or user cancelled the request — NOT a token failure.
+        // Re-throw immediately so the SDK sees it as a cancellation; don't rotate.
+        if (err?.name === "AbortError" || err?.code === 20) {
+          dlog(`[tok-rot] AbortError on token #${index + 1} — user/SDK cancel, not rotating`);
+          throw err;
+        }
+
         const ctx = {
           phase: "fetch_throw",
           url: reqSnap.url,
           method: reqSnap.method,
           token_index: index + 1,
           token_count: tokens.length,
-          request: { headers: reqSnap.headers, body: reqSnap.body },
-          error: err && (err.stack || err.message || String(err)),
-          error_name: err && err.name,
-          error_code: err && (err.code || err.errno || err.cause?.code),
+          skip_count: init._skipCount,
+          body_kind: reqSnap.bodyKind,
+          error: err?.stack || err?.message || String(err),
+          error_name: err?.name,
+          error_code: err?.code || err?.errno || err?.cause?.code,
         };
         log("[tok-rot] FETCH_ERROR", JSON.stringify(ctx, replacer));
-        // Fall through with r=undefined so the rotation logic below can still try the next token.
+        // r stays undefined → exhaustion logic below can still rotate
       }
 
-      if (urlStr.includes("/v1/messages")) {
-        let isExhausted = false;
-        let reasonLabel = "unknown";
-        let respSnap = null;
+      if (isMessages) {
+        let body;
+        try { if (r && (r.status >= 400)) body = await r.clone().json(); } catch (_) {}
 
-        if (!r || r.status === 500) {
-          isExhausted = true;
-          reasonLabel = !r ? "network_error" : "persistent_500";
-        } else if (r.status === 429 || r.status === 401 || r.status === 400 || r.status === 403) {
-          let body;
-          try { body = await r.clone().json(); } catch (_) {}
-          const msg = body?.error?.message ?? "";
-          const reason   = r?.headers?.get?.("anthropic-ratelimit-unified-overage-disabled-reason") || null;
-          const ovStatus = r?.headers?.get?.("anthropic-ratelimit-unified-overage-status") || null;
-          const hasRetry = !!r?.headers?.get?.("retry-after");
+        const { exhausted, reason } = exhaustionCheck(r, body);
 
-          isExhausted =
-            msg.includes("OAuth authentication is currently not allowed") ||
-            msg.includes("OAuth token has been revoked") ||
-            msg.toLowerCase().includes("organization has been disabled") ||
-            reason === "out_of_credits" ||
-            ovStatus === "rejected" ||
-            (!hasRetry && !reason && !ovStatus) ||
-            r.statusText === "Unauthorized";
+        const rlHdrs = rateLimitHeaders(r);
 
-          reasonLabel = isExhausted ? "token_exhausted" : "other_4xx";
-
-          // Always capture full failure context for /v1/messages 4xx — invaluable for tuning the
-          // exhaustion heuristic above.
-          respSnap = await snapshotResponse(r);
-          log("[tok-rot] /v1/messages 4xx", JSON.stringify({
-            phase: "non_2xx",
+        // Always log non-2xx for /v1/messages
+        if (!r || r.status >= 400) {
+          const snap = await snapshotResponse(r);
+          log("[tok-rot] /v1/messages non-2xx", JSON.stringify({
             url: urlStr,
+            attempt: init._skipCount + 1,
             token_index: index + 1,
             token_count: tokens.length,
-            decision: isExhausted ? "rotate" : "return_to_caller",
-            reason_label: reasonLabel,
-            heuristic: { msg, overage_reason: reason, overage_status: ovStatus, has_retry_after: hasRetry, statusText: r.statusText },
-            response: respSnap,
-            request: { method: reqSnap.method, headers: reqSnap.headers, body: reqSnap.body },
+            decision: exhausted ? "ROTATE" : "return_to_caller",
+            exhaustion_reason: reason,
+            rate_limit_headers: rlHdrs,
+            error_msg: body?.error?.message,
+            error_type: body?.error?.type ?? null,
+            status: r?.status,
+            statusText: r?.statusText,
+            body: snap?.body,
+            body_kind: reqSnap.bodyKind,
           }, replacer));
+        } else if (init._skipCount > 0) {
+          // Log success after rotation so we know which token worked
+          log(`[tok-rot] ✓ SUCCESS after ${init._skipCount} skip(s) | token=#${index + 1} | status=${r.status}`);
         }
 
         const MAX_SKIPS = tokens.length;
-        if (isExhausted && index < tokens.length - 1 && init._skipCount < MAX_SKIPS) {
+        if (exhausted && index < tokens.length - 1 && init._skipCount < MAX_SKIPS) {
+          const prevIndex = index;
           index++;
           init._skipCount++;
-          log(`[tok-rot] >>> ROTATING (${reasonLabel}) | Skip ${index}/${MAX_SKIPS} | New Token: #${index + 1}`);
+          log(`[tok-rot] ROTATING: token #${prevIndex + 1} exhausted (${reason}) → trying token #${index + 1} | skip=${init._skipCount}/${MAX_SKIPS}`);
           return recursiveFetch(input, init);
         }
-        if (isExhausted) {
-          log(`[tok-rot] EXHAUSTED — no more tokens to try (last token=#${index + 1}, total=${tokens.length})`);
+
+        if (exhausted) {
+          log(`[tok-rot] ALL TOKENS EXHAUSTED (last=${reason}) | tried ${init._skipCount + 1} token(s) | resetting index to 0`);
+          index = 0;
         }
       }
 
