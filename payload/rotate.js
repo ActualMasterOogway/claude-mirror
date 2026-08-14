@@ -175,13 +175,67 @@
     log(`[tok-rot] Found ${tokens.length} token(s), rotation disabled`);
   } else {
     let index = 0;
+    const getTok = () => tokens[index] ?? tokens[0];
 
-    Object.defineProperty(process.env, "CLAUDE_CODE_OAUTH_TOKEN", {
-      get: () => tokens[index] ?? tokens[0],
-      set: () => {},
-      configurable: true,
-      enumerable: true,
-    });
+    // Install a live, read-only CLAUDE_CODE_OAUTH_TOKEN on process.env so every
+    // read the host does (see extraction: it reads process.env.CLAUDE_CODE_OAUTH_TOKEN
+    // to build the accessToken) returns the CURRENT rotated token, and every write
+    // the host attempts (refresh paths do `process.env.CLAUDE_CODE_OAUTH_TOKEN = ...`)
+    // is swallowed so it can't clobber our rotation.
+    //
+    // Node: an accessor property descriptor on process.env works directly.
+    // Bun (v1.4+): process.env rejects accessor descriptors
+    // ("'process.env' does not accept an accessor(getter/setter) descriptor"),
+    // so we instead swap process.env for a Proxy that special-cases our key.
+    const installRotatingToken = () => {
+      // Path 1 — Node: accessor directly on process.env.
+      try {
+        Object.defineProperty(process.env, "CLAUDE_CODE_OAUTH_TOKEN", {
+          get: getTok,
+          set: () => {},
+          configurable: true,
+          enumerable: true,
+        });
+        if (process.env.CLAUDE_CODE_OAUTH_TOKEN === getTok()) return "env-accessor";
+      } catch (_) { /* fall through to Bun path */ }
+
+      // Path 2 — Bun: wrap process.env in a Proxy that intercepts our key.
+      try {
+        const realEnv = process.env;
+        const proxy = new Proxy(realEnv, {
+          get(t, p) { return p === "CLAUDE_CODE_OAUTH_TOKEN" ? getTok() : t[p]; },
+          set(t, p, v) {
+            if (p === "CLAUDE_CODE_OAUTH_TOKEN") return true; // swallow host writes
+            t[p] = v; return true;
+          },
+          deleteProperty(t, p) {
+            if (p === "CLAUDE_CODE_OAUTH_TOKEN") return true; // protect from delete
+            delete t[p]; return true;
+          },
+          has(t, p) { return p === "CLAUDE_CODE_OAUTH_TOKEN" ? true : (p in t); },
+        });
+        try {
+          Object.defineProperty(process, "env", {
+            get: () => proxy,
+            set: () => {},
+            configurable: true,
+            enumerable: true,
+          });
+        } catch (_) {
+          process.env = proxy;
+        }
+        if (process.env.CLAUDE_CODE_OAUTH_TOKEN === getTok()) return "env-proxy";
+      } catch (_) {}
+
+      return "failed";
+    };
+
+    const tokMode = installRotatingToken();
+    if (tokMode === "failed") {
+      log(`[tok-rot] WARN could not install live token accessor; rotation still applies via fetch Authorization header`);
+    } else {
+      log(`[tok-rot] live token accessor installed via ${tokMode}`);
+    }
 
     log(`[tok-rot] Rotation ENABLED: ${tokens.length} tokens loaded`);
 
@@ -227,7 +281,7 @@
       if (r.status === 401)                                               return { exhausted: true, reason: "401" };
 
       // Credit/overage exhaustion
-      if (reason === "out_of_credits" || reason === "org_level_disabled")
+      if (reason === "out_of_credits" || reason === "org_level_disabled" || reason === "org_level_disabled_until")
                                         return { exhausted: true,  reason: reason };
       if (ovStatus === "rejected")      return { exhausted: true,  reason: "overage_rejected" };
 
