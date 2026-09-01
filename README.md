@@ -4,7 +4,7 @@ A self-updating patched mirror of [Claude Code](https://github.com/anthropics/cl
 
 A GitHub Actions workflow polls the upstream GCS release channel every 15 minutes. When it sees a new version, it downloads every platform build (`linux-x64`, `linux-x64-musl`, `darwin-x64`, `win32-x64`), extracts the main module's JavaScript as `dumped.js` for easy reading, injects [`payload/rotate.js`](payload/rotate.js) into each binary's `.bun` section with [`scripts/bun_patcher.py`](scripts/bun_patcher.py), and publishes the result as a GitHub Release tagged `v{version}`. It then commits the new upstream version numbers to the repo's `latest` and `stable` text files so a patched client can find them.
 
-The injected payload rewrites Claude Code's update-check URLs to point back at this repo, so a patched client keeps pulling patched updates. It also rotates across a comma-separated list of OAuth tokens in `CLAUDE_CODE_OAUTH_TOKEN` whenever the current one hits a quota wall or an auth failure.
+The injected payload rewrites Claude Code's update-check URLs to point back at this repo, so a patched client keeps pulling patched updates. It also rotates credentials whenever the active one hits a quota wall or an auth failure - across `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY` lists (in that precedence order, matching Claude Code's own auth resolution), on api.anthropic.com and on any custom `ANTHROPIC_BASE_URL` serving the `/v1/messages` protocol.
 
 ## Repository layout
 
@@ -61,17 +61,31 @@ Use the Run workflow button on the Actions tab. The `force_version` input rebuil
 
 Always active. Rewrites the three URL shapes listed above and logs every redirect to `~/.claude/tok-rot.log`.
 
-### Token rotation
+### Credential rotation
 
-Active only when `CLAUDE_CODE_OAUTH_TOKEN` contains two or more comma-separated tokens:
+Active only when the highest-priority credential env var contains **two or more** entries; with zero or one entry the payload stays fully hands-off and Claude Code's native auth runs untouched.
+
+Families, in Claude Code's own resolution order (`dN()` in the extraction) - the first non-empty one wins and the others are ignored:
+
+1. `ANTHROPIC_AUTH_TOKEN` - sent as `Authorization: Bearer <token>`
+2. `CLAUDE_CODE_OAUTH_TOKEN` - sent as `Authorization: Bearer <token>`
+3. `ANTHROPIC_API_KEY` - sent as `x-api-key: <key>` (matching how Claude Code itself switches wire formats; any stale `Authorization` header is dropped)
+
+Entries are separated by commas, newlines, semicolons, or whitespace:
 
 ```
 export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-AAA...,sk-ant-oat01-BBB...,sk-ant-oat01-CCC..."
+# a pasted column of one token per line works identically
 ```
 
-On any Anthropic `/v1/messages` response that looks like quota or auth exhaustion (429/401/400/403 without a `retry-after`, `OAuth authentication is currently not allowed`, `out_of_credits` overage status, and so on), the payload advances to the next token and retries the request. Up to 15 rotations per request.
+Requests are recognized by host (`*.anthropic.com`) *or* by protocol shape (any URL whose path contains `/v1/messages`, so custom `ANTHROPIC_BASE_URL` gateways like `https://openrouter.ai/api` are covered too).
 
-The current token is injected into outgoing requests as `Authorization: Bearer <token>`, so Claude Code's own auth path stays untouched.
+On a response whose failure is **credential-caused**, the payload advances to the next entry and retries; request-scoped failures are returned to the caller untouched because rotating cannot help:
+
+- Rotate: 401 / `authentication_error`, revoked or not-allowed OAuth messages, disabled organization, 403 `permission_error`, `billing_error` (console keys report an empty wallet as 400, not 429), `credit balance is too low`, overage headers (`out_of_credits`, `org_level_disabled*`, `rejected`), 429 without `retry-after`, persistent 500 after same-token retries.
+- Don't rotate: 429 with `retry-after` (SDK backoff), 400/404 malformed-or-missing requests, 413/422 oversized bodies, 529 overloaded.
+
+Every startup logs all three family counts plus PID to `~/.claude/tok-rot.log`, e.g. `[tok-rot] pid=123 creds: ANTHROPIC_AUTH_TOKEN=0(0ch) CLAUDE_CODE_OAUTH_TOKEN=317(24311ch) ANTHROPIC_API_KEY=0(0ch)` - useful when several patched sessions share the log. Set `CLAUDE_MIRROR_DEBUG=1` for per-request traces.
 
 ## The patcher
 

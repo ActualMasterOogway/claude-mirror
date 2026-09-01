@@ -626,6 +626,18 @@ def _adjust_string_pointers(
     """
     Walk every StringPointer in every module entry and shift offsets/lengths
     that straddle or follow *inject_rel* by *delta* bytes.
+
+    Two cases:
+    - sp_off > inject_rel: payload is entirely before this SP -> shift offset.
+    - sp_off <= inject_rel <= sp_off+sp_len: payload is inside (or at the
+      start of) this SP's data -> extend length so the runtime sees both the
+      injected bytes and the original data.
+
+    Using strict `>` (not `>=`) for the offset-shift branch is intentional:
+    when injection is at the very start of a data region (sp_off == inject_rel,
+    the ESM entry-module case), we must extend the length rather than shift
+    the offset -- shifting would cause the runtime's StringPointer to skip
+    past the payload, making it invisible to the JS engine.
     """
     updated = 0
     for i in range(len(graph.entries)):
@@ -636,7 +648,7 @@ def _adjust_string_pointers(
             sp_len = _u32(buf, sp_pos + 4)
             if sp_off == 0 and sp_len == 0:
                 continue
-            if sp_off >= inject_rel:
+            if sp_off > inject_rel:
                 _p32(buf, sp_pos, sp_off + delta)
                 updated += 1
             elif sp_off + sp_len > inject_rel:
